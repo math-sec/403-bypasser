@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,18 +15,19 @@ import (
 
 func main() {
 	config := scanner.Config{}
+	var testMode string
 
 	flag.StringVar(&config.URL, "u", "", "Single URL to target.")
 	flag.StringVar(&config.URLList, "l", "", "File containing a list of URLs to target.")
+	flag.IntVar(&config.Concurrency, "c", 10, "Number of concurrent workers.")
+	flag.DurationVar(&config.Timeout, "t", 10*time.Second, "Request timeout duration.")
+	flag.BoolVar(&config.Insecure, "k", false, "Skip SSL/TLS certificate verification.")
+	flag.IntVar(&config.Verbosity, "v", 0, "Verbosity level (1, 2, or 3).")
+	flag.StringVar(&testMode, "mode", "all", "Test mode to run. Options: all, path, method, header, useragent, hbh, version.")
 	flag.StringVar(&config.HTTPMethodsFile, "http-methods", "wordlists/httpmethods.txt", "File with HTTP methods for fuzzing.")
 	flag.StringVar(&config.HTTPHeadersFile, "http-headers", "wordlists/httpheaders.txt", "File with HTTP headers for injection.")
 	flag.StringVar(&config.UserAgentsFile, "user-agent", "wordlists/useragents.txt", "File with User-Agents for fuzzing.")
 	flag.StringVar(&config.HopByHopHeadersFile, "hbh-headers", "wordlists/hbh-headers.txt", "File with headers for Hop-by-Hop tests.")
-	flag.IntVar(&config.Concurrency, "c", 10, "Number of concurrent workers.")
-	flag.DurationVar(&config.Timeout, "t", 10*time.Second, "Request timeout duration.")
-	flag.BoolVar(&config.Insecure, "k", false, "Skip SSL/TLS certificate verification.")
-	// <<< NOVA FLAG DE VERBOSIDADE ADICIONADA >>>
-	flag.IntVar(&config.Verbosity, "v", 0, "Verbosity level (1, 2, or 3).")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "403 Bypasser - A tool to test for 403 Forbidden bypass techniques.\n\n")
@@ -41,10 +43,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	config.TestMode = strings.ToLower(testMode)
+
 	urls := make(chan string, config.Concurrency)
 	var wg sync.WaitGroup
 
-	// Start workers
 	for i := 0; i < config.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
@@ -56,7 +59,6 @@ func main() {
 		}()
 	}
 
-	// Distribute jobs
 	if config.URL != "" {
 		urls <- config.URL
 	}
