@@ -30,14 +30,15 @@ type Config struct {
 	Timeout             time.Duration
 	Insecure            bool
 	Verbosity           int
-	TestMode            string
+	ModesToRun          map[string]bool
 	FilterSizes         map[int]bool
 }
 
 type Scanner struct {
-	config  Config
-	client  *http.Client
-	limiter *rate.Limiter
+	config                 Config
+	client                 *http.Client
+	limiter                *rate.Limiter
+	falsePositiveSignatures map[string]int
 }
 
 type Result struct {
@@ -72,7 +73,12 @@ func NewScanner(config Config, limiter *rate.Limiter) *Scanner {
 			return http.ErrUseLastResponse
 		},
 	}
-	return &Scanner{config: config, client: client, limiter: limiter}
+	return &Scanner{
+		config:                 config,
+		client:                 client,
+		limiter:                limiter,
+		falsePositiveSignatures: make(map[string]int),
+	}
 }
 
 func (s *Scanner) sendRequest(method, targetURL string, headers map[string]string) (*http.Response, *http.Request, error) {
@@ -87,6 +93,11 @@ func (s *Scanner) sendRequest(method, targetURL string, headers map[string]strin
 	for key, value := range headers {
 		req.Header.Set(key, value)
 	}
+	if _, found := headers["Host"]; !found {
+	} else if headers["Host"] == "" {
+		req.Host = ""
+	}
+
 	resp, err := s.client.Do(req)
 	return resp, req, err
 }
@@ -117,7 +128,7 @@ func (s *Scanner) Scan(baseURL string) {
 func (s *Scanner) runAllTests(targetURL string) {
 	resp, _, err := s.sendRequest("GET", targetURL, nil)
 	if err != nil {
-		utils.PrintError(fmt.Sprintf("Initial request to %s failed: %v", targetURL, err))
+		utils.PrintError(fmt.Sprintf("Initial request to %s failed: %v", err))
 		return
 	}
 	defer resp.Body.Close()
@@ -132,29 +143,34 @@ func (s *Scanner) runAllTests(targetURL string) {
 	if initialStatusCode != 403 {
 		utils.PrintWarning(fmt.Sprintf("Initial status code is %d, not 403. Results may vary.", initialStatusCode))
 	}
+
+	runAll := s.config.ModesToRun["all"]
 	testsToRun := make(map[string]func())
-	if s.config.TestMode == "all" || s.config.TestMode == "path" {
+
+	if runAll || s.config.ModesToRun["path"] {
 		testsToRun["path"] = func() { s.testPathPermutations(targetURL, initialStatusCode, initialSize) }
 	}
-	if s.config.TestMode == "all" || s.config.TestMode == "method" {
+	if runAll || s.config.ModesToRun["method"] {
 		testsToRun["method"] = func() { s.testHTTPMethods(targetURL, initialStatusCode, initialSize) }
 	}
-	if s.config.TestMode == "all" || s.config.TestMode == "header" {
+	if runAll || s.config.ModesToRun["header"] {
 		testsToRun["header"] = func() { s.testHeaderInjection(targetURL, initialStatusCode, initialSize) }
 	}
-	if s.config.TestMode == "all" || s.config.TestMode == "useragent" {
+	if s.config.ModesToRun["useragent"] { // Não roda com 'all'
 		testsToRun["useragent"] = func() { s.testUserAgents(targetURL, initialStatusCode, initialSize) }
 	}
-	if s.config.TestMode == "all" || s.config.TestMode == "hbh" {
+	if runAll || s.config.ModesToRun["hbh"] {
 		testsToRun["hbh"] = func() { s.testHopByHop(targetURL, initialStatusCode) }
 	}
-	if s.config.TestMode == "all" || s.config.TestMode == "version" {
+	if runAll || s.config.ModesToRun["version"] {
 		testsToRun["version"] = func() { s.testHTTPVersions(targetURL, initialStatusCode, initialSize) }
 	}
-	if len(testsToRun) == 0 {
-		utils.PrintError(fmt.Sprintf("Invalid test mode specified: %s", s.config.TestMode))
+
+	if len(testsToRun) == 0 && !s.config.ModesToRun["all"] {
+		utils.PrintError(fmt.Sprintf("Invalid test mode specified. Use one of: all, path, method, header, useragent, hbh, version"))
 		return
 	}
+
 	var wg sync.WaitGroup
 	wg.Add(len(testsToRun))
 	for _, testFunc := range testsToRun {
@@ -190,6 +206,15 @@ func (s *Scanner) checkAndReport(technique, payload, method, url string, headers
 		shouldReport = false
 	}
 	if shouldReport {
+		signature := fmt.Sprintf("status:%d,size:%d", resp.StatusCode, currentSize)
+		s.falsePositiveSignatures[signature]++
+		count := s.falsePositiveSignatures[signature]
+
+		if count > 2 {
+			s.log(2, "Suppressing already detected pattern: %s", signature)
+			return
+		}
+
 		var reason string
 		if statusChanged && sizeChanged {
 			reason = fmt.Sprintf("Status (%d -> %d) AND Size (%d -> %d) changed", initialStatus, resp.StatusCode, initialSize, currentSize)
@@ -200,6 +225,10 @@ func (s *Scanner) checkAndReport(technique, payload, method, url string, headers
 		}
 		result := Result{URL: url, Technique: technique, Payload: payload, StatusCode: resp.StatusCode, Curl: utils.GenerateCurlCommand(req), Reason: reason}
 		s.printResult(result)
+
+		if count == 2 {
+			utils.PrintInfo(fmt.Sprintf("  └── This response pattern has been seen multiple times and will be suppressed from now on."))
+		}
 	} else {
 		s.log(3, "No change for '%s' (Status: %d, Size: %d)", payload, resp.StatusCode, currentSize)
 	}
@@ -352,6 +381,7 @@ func (s *Scanner) testHTTPMethods(baseURL string, initialStatus int, initialSize
 
 func (s *Scanner) testHeaderInjection(baseURL string, initialStatus int, initialSize int) {
 	s.log(1, "Starting Header Injection tests...")
+	s.checkAndReport("Remove Host Header", "Host: <empty>", "GET", baseURL, map[string]string{"Host": ""}, initialStatus, initialSize)
 	headers, err := utils.ReadLines(s.config.HTTPHeadersFile)
 	if err != nil {
 		utils.PrintError(fmt.Sprintf("Could not read HTTP headers file: %v", err))
