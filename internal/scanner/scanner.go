@@ -181,7 +181,13 @@ func (s *Scanner) checkAndReport(technique, payload, method, url string, headers
 	statusChanged := resp.StatusCode != initialStatus
 	sizeChanged := currentSize != initialSize
 
-	if (statusChanged || sizeChanged) && resp.StatusCode != 404 {
+	shouldReport := (statusChanged || sizeChanged) && resp.StatusCode != 404
+
+	if technique == "Method Fuzzing" && resp.StatusCode == 405 {
+		shouldReport = false
+	}
+
+	if shouldReport {
 		var reason string
 		if statusChanged && sizeChanged {
 			reason = fmt.Sprintf("Status (%d -> %d) AND Size (%d -> %d) changed", initialStatus, resp.StatusCode, initialSize, currentSize)
