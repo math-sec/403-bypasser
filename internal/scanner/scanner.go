@@ -1,6 +1,7 @@
 package scanner
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"io"
@@ -14,6 +15,7 @@ import (
 
 	"403-bypasser/internal/utils"
 	"github.com/fatih/color"
+	"golang.org/x/time/rate"
 	// "github.com/quic-go/quic-go/http3"
 )
 
@@ -29,11 +31,13 @@ type Config struct {
 	Insecure            bool
 	Verbosity           int
 	TestMode            string
+	FilterSizes         map[int]bool
 }
 
 type Scanner struct {
-	config Config
-	client *http.Client
+	config  Config
+	client  *http.Client
+	limiter *rate.Limiter
 }
 
 type Result struct {
@@ -56,7 +60,7 @@ func (s *Scanner) log(level int, format string, args ...interface{}) {
 	}
 }
 
-func NewScanner(config Config) *Scanner {
+func NewScanner(config Config, limiter *rate.Limiter) *Scanner {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: config.Insecure},
 		DisableKeepAlives: true,
@@ -68,10 +72,13 @@ func NewScanner(config Config) *Scanner {
 			return http.ErrUseLastResponse
 		},
 	}
-	return &Scanner{config: config, client: client}
+	return &Scanner{config: config, client: client, limiter: limiter}
 }
 
 func (s *Scanner) sendRequest(method, targetURL string, headers map[string]string) (*http.Response, *http.Request, error) {
+	if s.limiter != nil {
+		s.limiter.Wait(context.Background())
+	}
 	req, err := http.NewRequest(method, targetURL, nil)
 	if err != nil {
 		return nil, nil, err
@@ -121,12 +128,10 @@ func (s *Scanner) runAllTests(targetURL string) {
 		return
 	}
 	initialSize := len(initialBody)
-
 	utils.PrintInfo(fmt.Sprintf("Testing against %s (Initial Status: %d, Initial Size: %d bytes)", targetURL, initialStatusCode, initialSize))
 	if initialStatusCode != 403 {
 		utils.PrintWarning(fmt.Sprintf("Initial status code is %d, not 403. Results may vary.", initialStatusCode))
 	}
-
 	testsToRun := make(map[string]func())
 	if s.config.TestMode == "all" || s.config.TestMode == "path" {
 		testsToRun["path"] = func() { s.testPathPermutations(targetURL, initialStatusCode, initialSize) }
@@ -146,15 +151,12 @@ func (s *Scanner) runAllTests(targetURL string) {
 	if s.config.TestMode == "all" || s.config.TestMode == "version" {
 		testsToRun["version"] = func() { s.testHTTPVersions(targetURL, initialStatusCode, initialSize) }
 	}
-
 	if len(testsToRun) == 0 {
 		utils.PrintError(fmt.Sprintf("Invalid test mode specified: %s", s.config.TestMode))
 		return
 	}
-
 	var wg sync.WaitGroup
 	wg.Add(len(testsToRun))
-
 	for _, testFunc := range testsToRun {
 		go func(f func()) {
 			defer wg.Done()
@@ -171,22 +173,22 @@ func (s *Scanner) checkAndReport(technique, payload, method, url string, headers
 		return
 	}
 	defer resp.Body.Close()
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		s.log(3, "Failed to read response body for '%s'", url)
 		return
 	}
 	currentSize := len(body)
+	if _, found := s.config.FilterSizes[currentSize]; found {
+		s.log(3, "Response size %d matches filter, ignoring.", currentSize)
+		return
+	}
 	statusChanged := resp.StatusCode != initialStatus
 	sizeChanged := currentSize != initialSize
-
 	shouldReport := (statusChanged || sizeChanged) && resp.StatusCode != 404
-
 	if technique == "Method Fuzzing" && resp.StatusCode == 405 {
 		shouldReport = false
 	}
-
 	if shouldReport {
 		var reason string
 		if statusChanged && sizeChanged {
@@ -259,7 +261,6 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 	if len(pathParts) == 0 || (len(pathParts) == 1 && pathParts[0] == "") {
 		return
 	}
-
 	generatedTests := make(map[string]bool)
 	runTest := func(technique, payload, url string) {
 		if !generatedTests[url] {
@@ -267,7 +268,6 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 			generatedTests[url] = true
 		}
 	}
-
 	affixPayloads := []string{
 		"..;", "/..;", ".;", "/.;", ";", "/;", "~", ".json", "/.json", ".html", ".css", "%00", "%20", "%09", "%0a", "%0d",
 		"%25", "%23", "%26", "%3f", "#", "../", "./", "/*", "/%2f", "/%2e", "..%3B/", `..\;/`,
@@ -304,7 +304,6 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 			runTest("Character Insertion", "+", u.Scheme+"://"+u.Host+"/"+strings.Join(tempParts, "/"))
 		}
 	}
-
 	wrappers := map[string]string{"//": "//", "///": "///", "./": "./"}
 	for pre, suf := range wrappers {
 		runTest("Path Wrapper", pre+"..."+suf, u.Scheme+"://"+u.Host+"/"+pre+path+suf)
@@ -316,7 +315,6 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 		runTest("Global Suffix", suffix, u.Scheme+"://"+u.Host+"/"+path+suffix)
 	}
 	runTest("Query Parameter", "?id=1", u.Scheme+"://"+u.Host+"/"+path+"?id=1")
-
 	for i, originalPart := range pathParts {
 		if originalPart == "" {
 			continue
@@ -328,7 +326,6 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 				copy(tempParts, pathParts)
 				tempParts[i] = originalPart[:j] + singleEncoded + originalPart[j+1:]
 				runTest("Single Char Encode", singleEncoded, u.Scheme+"://"+u.Host+"/"+strings.Join(tempParts, "/"))
-
 				doubleEncoded := strings.Replace(singleEncoded, "%", "%25", 1)
 				copy(tempParts, pathParts)
 				tempParts[i] = originalPart[:j] + doubleEncoded + originalPart[j+1:]
