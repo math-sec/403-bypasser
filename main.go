@@ -26,9 +26,9 @@ func main() {
 	flag.DurationVar(&config.Timeout, "t", 10*time.Second, "Request timeout duration.")
 	flag.BoolVar(&config.Insecure, "k", false, "Skip SSL/TLS certificate verification.")
 	flag.IntVar(&config.Verbosity, "v", 0, "Verbosity level (1, 2, or 3).")
-	flag.StringVar(&testMode, "mode", "all", "Test mode to run. Options: all, path, method, header, useragent, hbh, version.")
+	flag.StringVar(&testMode, "mode", "all", "Tests to run (comma-separated: all, path, method, header, useragent, hbh, version).")
 	flag.IntVar(&rps, "rps", 0, "Max requests per second (0 for no limit).")
-	flag.StringVar(&filterSizesStr, "fs", "", "Filter out responses with these specific sizes (comma-separated, e.g., 118,0,345).")
+	flag.StringVar(&filterSizesStr, "fs", "", "Filter out responses with these sizes (comma-separated, e.g., 118,0,345).")
 	flag.StringVar(&config.HTTPMethodsFile, "http-methods", "wordlists/httpmethods.txt", "File with HTTP methods for fuzzing.")
 	flag.StringVar(&config.HTTPHeadersFile, "http-headers", "wordlists/httpheaders.txt", "File with HTTP headers for injection.")
 	flag.StringVar(&config.UserAgentsFile, "user-agent", "wordlists/useragents.txt", "File with User-Agents for fuzzing.")
@@ -48,7 +48,11 @@ func main() {
 		os.Exit(1)
 	}
 
-	config.TestMode = strings.ToLower(testMode)
+	config.ModesToRun = make(map[string]bool)
+	modes := strings.Split(strings.ToLower(testMode), ",")
+	for _, m := range modes {
+		config.ModesToRun[strings.TrimSpace(m)] = true
+	}
 
 	config.FilterSizes = make(map[int]bool)
 	if filterSizesStr != "" {
@@ -91,7 +95,6 @@ func main() {
 			os.Exit(1)
 		}
 		defer file.Close()
-
 		fileScanner := bufio.NewScanner(file)
 		for fileScanner.Scan() {
 			urls <- fileScanner.Text()
