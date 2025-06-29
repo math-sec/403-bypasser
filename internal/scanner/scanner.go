@@ -8,37 +8,46 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
 	"unicode"
 
 	"403-bypasser/internal/utils"
-	"github.com/fatih/color"
+	"github.com/schollz/progressbar/v3"
 	"golang.org/x/time/rate"
 	// "github.com/quic-go/quic-go/http3"
 )
 
 type Config struct {
-	URL                 string
-	URLList             string
-	HTTPMethodsFile     string
-	HTTPHeadersFile     string
-	UserAgentsFile      string
-	HopByHopHeadersFile string
-	Concurrency         int
-	Timeout             time.Duration
-	Insecure            bool
-	Verbosity           int
-	ModesToRun          map[string]bool
-	FilterSizes         map[int]bool
+	URL                    string
+	URLList                string
+	HTTPMethodsFile        string
+	HTTPHeadersFile        string
+	UserAgentsFile         string
+	HopByHopHeadersFile    string
+	Concurrency            int
+	Timeout                time.Duration
+	Insecure               bool
+	Verbosity              int
+	ModesToRun             map[string]bool
+	FilterSizes            map[int]bool
+	FalsePositiveThreshold int
+	RunHTTP09              bool
+}
+
+type SharedSignatureMap struct {
+	Signatures map[string]int
+	Mutex      *sync.Mutex
 }
 
 type Scanner struct {
-	config                 Config
-	client                 *http.Client
-	limiter                *rate.Limiter
-	falsePositiveSignatures map[string]int
+	config           Config
+	client           *http.Client
+	limiter          *rate.Limiter
+	sharedSignatures *SharedSignatureMap
+	bar              *progressbar.ProgressBar
 }
 
 type Result struct {
@@ -46,22 +55,22 @@ type Result struct {
 	Technique  string
 	Payload    string
 	StatusCode int
-	Curl       string
+	Size       int
 	Reason     string
+	Curl       string
 }
-
-var printMutex sync.Mutex
 
 func (s *Scanner) log(level int, format string, args ...interface{}) {
 	if s.config.Verbosity >= level {
-		printMutex.Lock()
-		defer printMutex.Unlock()
-		msg := fmt.Sprintf(format, args...)
-		fmt.Printf("[%s] %s\n", color.New(color.FgBlue).SprintFunc()("VERBOSE"), msg)
+		if s.bar != nil {
+			s.bar.Describe(fmt.Sprintf(format, args...))
+		} else {
+			fmt.Fprintf(os.Stderr, "[VERBOSE] "+format+"\n", args...)
+		}
 	}
 }
 
-func NewScanner(config Config, limiter *rate.Limiter) *Scanner {
+func NewScanner(config Config, limiter *rate.Limiter, sharedSigs *SharedSignatureMap, bar *progressbar.ProgressBar) *Scanner {
 	transport := &http.Transport{
 		TLSClientConfig: &tls.Config{InsecureSkipVerify: config.Insecure},
 		DisableKeepAlives: true,
@@ -74,10 +83,11 @@ func NewScanner(config Config, limiter *rate.Limiter) *Scanner {
 		},
 	}
 	return &Scanner{
-		config:                 config,
-		client:                 client,
-		limiter:                limiter,
-		falsePositiveSignatures: make(map[string]int),
+		config:           config,
+		client:           client,
+		limiter:          limiter,
+		sharedSignatures: sharedSigs,
+		bar:              bar,
 	}
 }
 
@@ -97,14 +107,15 @@ func (s *Scanner) sendRequest(method, targetURL string, headers map[string]strin
 	} else if headers["Host"] == "" {
 		req.Host = ""
 	}
-
+	if s.bar != nil {
+		_ = s.bar.Add(1)
+	}
 	resp, err := s.client.Do(req)
 	return resp, req, err
 }
 
-func (s *Scanner) Scan(baseURL string) {
-	fmt.Println()
-	utils.PrintInfo(fmt.Sprintf("Starting scan for: %s", baseURL))
+func (s *Scanner) Scan(baseURL string, resultsChan chan<- Result) {
+	s.log(1, "Scanning: %s", baseURL)
 	schemes := []string{"https"}
 	httpURL := strings.Replace(baseURL, "https://", "http://", 1)
 	if !strings.HasPrefix(httpURL, "http://") {
@@ -121,59 +132,55 @@ func (s *Scanner) Scan(baseURL string) {
 		if !strings.Contains(targetURL, "://") {
 			targetURL = scheme + "://" + targetURL
 		}
-		s.runAllTests(targetURL)
+		s.runAllTests(targetURL, resultsChan)
 	}
 }
 
-func (s *Scanner) runAllTests(targetURL string) {
+func (s *Scanner) runAllTests(targetURL string, resultsChan chan<- Result) {
 	resp, _, err := s.sendRequest("GET", targetURL, nil)
 	if err != nil {
-		utils.PrintError(fmt.Sprintf("Initial request to %s failed: %v", err))
+		s.log(1, "[ERROR] Initial request to %s failed: %v", targetURL, err)
 		return
 	}
 	defer resp.Body.Close()
 	initialStatusCode := resp.StatusCode
 	initialBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		utils.PrintError(fmt.Sprintf("Failed to read initial response body: %v", err))
+		s.log(1, "[ERROR] Failed to read initial response body for %s: %v", targetURL, err)
 		return
 	}
 	initialSize := len(initialBody)
-	utils.PrintInfo(fmt.Sprintf("Testing against %s (Initial Status: %d, Initial Size: %d bytes)", targetURL, initialStatusCode, initialSize))
+	s.log(1, "Testing against %s (Initial Status: %d, Initial Size: %d bytes)", targetURL, initialStatusCode, initialSize)
 	if initialStatusCode != 403 {
-		utils.PrintWarning(fmt.Sprintf("Initial status code is %d, not 403. Results may vary.", initialStatusCode))
+		s.log(1, "[WARNING] Initial status for %s is %d, not 403. Results may vary.", targetURL, initialStatusCode)
 	}
-
 	runAll := s.config.ModesToRun["all"]
-	testsToRun := make(map[string]func())
-
+	var testFuncs []func()
 	if runAll || s.config.ModesToRun["path"] {
-		testsToRun["path"] = func() { s.testPathPermutations(targetURL, initialStatusCode, initialSize) }
+		testFuncs = append(testFuncs, func() { s.testPathPermutations(targetURL, initialStatusCode, initialSize, resultsChan) })
 	}
 	if runAll || s.config.ModesToRun["method"] {
-		testsToRun["method"] = func() { s.testHTTPMethods(targetURL, initialStatusCode, initialSize) }
+		testFuncs = append(testFuncs, func() { s.testHTTPMethods(targetURL, initialStatusCode, initialSize, resultsChan) })
 	}
 	if runAll || s.config.ModesToRun["header"] {
-		testsToRun["header"] = func() { s.testHeaderInjection(targetURL, initialStatusCode, initialSize) }
+		testFuncs = append(testFuncs, func() { s.testHeaderInjection(targetURL, initialStatusCode, initialSize, resultsChan) })
 	}
-	if s.config.ModesToRun["useragent"] { // Não roda com 'all'
-		testsToRun["useragent"] = func() { s.testUserAgents(targetURL, initialStatusCode, initialSize) }
+	if s.config.ModesToRun["useragent"] {
+		testFuncs = append(testFuncs, func() { s.testUserAgents(targetURL, initialStatusCode, initialSize, resultsChan) })
 	}
 	if runAll || s.config.ModesToRun["hbh"] {
-		testsToRun["hbh"] = func() { s.testHopByHop(targetURL, initialStatusCode) }
+		testFuncs = append(testFuncs, func() { s.testHopByHop(targetURL, initialStatusCode, resultsChan) })
 	}
 	if runAll || s.config.ModesToRun["version"] {
-		testsToRun["version"] = func() { s.testHTTPVersions(targetURL, initialStatusCode, initialSize) }
+		testFuncs = append(testFuncs, func() { s.testHTTPVersions(targetURL, initialStatusCode, initialSize, resultsChan) })
 	}
-
-	if len(testsToRun) == 0 && !s.config.ModesToRun["all"] {
-		utils.PrintError(fmt.Sprintf("Invalid test mode specified. Use one of: all, path, method, header, useragent, hbh, version"))
+	if len(testFuncs) == 0 && !s.config.ModesToRun["all"] {
+		s.log(1, "[ERROR] Invalid test mode specified.")
 		return
 	}
-
 	var wg sync.WaitGroup
-	wg.Add(len(testsToRun))
-	for _, testFunc := range testsToRun {
+	wg.Add(len(testFuncs))
+	for _, testFunc := range testFuncs {
 		go func(f func()) {
 			defer wg.Done()
 			f()
@@ -182,8 +189,8 @@ func (s *Scanner) runAllTests(targetURL string) {
 	wg.Wait()
 }
 
-func (s *Scanner) checkAndReport(technique, payload, method, url string, headers map[string]string, initialStatus int, initialSize int) {
-	s.log(2, "Attempting Technique: %s, Payload: '%s', URL: %s", technique, payload, url)
+func (s *Scanner) checkAndReport(technique, payload, method, url string, headers map[string]string, initialStatus int, initialSize int, resultsChan chan<- Result) {
+	s.log(2, "Attempting: %s, Payload: '%s'", technique, payload)
 	resp, req, err := s.sendRequest(method, url, headers)
 	if err != nil {
 		return
@@ -201,52 +208,25 @@ func (s *Scanner) checkAndReport(technique, payload, method, url string, headers
 	}
 	statusChanged := resp.StatusCode != initialStatus
 	sizeChanged := currentSize != initialSize
-	shouldReport := (statusChanged || sizeChanged) && resp.StatusCode != 404
+	shouldReport := (statusChanged || sizeChanged) && resp.StatusCode != 404 && resp.StatusCode != 400
 	if technique == "Method Fuzzing" && resp.StatusCode == 405 {
 		shouldReport = false
 	}
+	if method == "HEAD" && !statusChanged && currentSize == 0 {
+		shouldReport = false
+	}
+	if (resp.StatusCode == 301 || resp.StatusCode == 302 || resp.StatusCode == 307 || resp.StatusCode == 308) {
+		location, err := resp.Location()
+		if err == nil && (location.String() == url+"/" || location.String() == url) {
+			shouldReport = false
+		}
+	}
 	if shouldReport {
-		signature := fmt.Sprintf("status:%d,size:%d", resp.StatusCode, currentSize)
-		s.falsePositiveSignatures[signature]++
-		count := s.falsePositiveSignatures[signature]
-
-		if count > 2 {
-			s.log(2, "Suppressing already detected pattern: %s", signature)
-			return
-		}
-
-		var reason string
-		if statusChanged && sizeChanged {
-			reason = fmt.Sprintf("Status (%d -> %d) AND Size (%d -> %d) changed", initialStatus, resp.StatusCode, initialSize, currentSize)
-		} else if statusChanged {
-			reason = fmt.Sprintf("Status changed (%d -> %d)", initialStatus, resp.StatusCode)
-		} else {
-			reason = fmt.Sprintf("Size changed (%d -> %d)", initialSize, currentSize)
-		}
-		result := Result{URL: url, Technique: technique, Payload: payload, StatusCode: resp.StatusCode, Curl: utils.GenerateCurlCommand(req), Reason: reason}
-		s.printResult(result)
-
-		if count == 2 {
-			utils.PrintInfo(fmt.Sprintf("  └── This response pattern has been seen multiple times and will be suppressed from now on."))
-		}
+		reason := fmt.Sprintf("Status (%d -> %d), Size (%d -> %d)", initialStatus, resp.StatusCode, initialSize, currentSize)
+		resultsChan <- Result{URL: url, Technique: technique, Payload: payload, StatusCode: resp.StatusCode, Size: currentSize, Curl: utils.GenerateCurlCommand(req, technique), Reason: reason}
 	} else {
 		s.log(3, "No change for '%s' (Status: %d, Size: %d)", payload, resp.StatusCode, currentSize)
 	}
-}
-
-func (s *Scanner) printResult(r Result) {
-	printMutex.Lock()
-	defer printMutex.Unlock()
-	msg := fmt.Sprintf("URL: %s | Technique: %s | Payload: '%s' | New Status: %d", r.URL, r.Technique, r.Payload, r.StatusCode)
-	if r.StatusCode >= 200 && r.StatusCode < 300 {
-		utils.PrintSuccess("Endpoint possibly bypassed successfully!")
-		utils.PrintSuccess(msg)
-	} else {
-		utils.PrintWarning("Anomalous behavior detected!")
-		utils.PrintWarning(msg)
-	}
-	utils.PrintInfo(fmt.Sprintf("  └── Reason: %s", r.Reason))
-	fmt.Printf("   └── CURL: %s\n", r.Curl)
 }
 
 func generateCasePermutations(s string) []string {
@@ -279,7 +259,7 @@ func generateCasePermutations(s string) []string {
 	return result
 }
 
-func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initialSize int) {
+func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initialSize int, resultsChan chan<- Result) {
 	s.log(1, "Starting Path Permutation tests...")
 	u, err := url.Parse(baseURL)
 	if err != nil {
@@ -293,13 +273,13 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 	generatedTests := make(map[string]bool)
 	runTest := func(technique, payload, url string) {
 		if !generatedTests[url] {
-			s.checkAndReport(technique, payload, "GET", url, nil, initialStatus, initialSize)
+			s.checkAndReport(technique, payload, "GET", url, nil, initialStatus, initialSize, resultsChan)
 			generatedTests[url] = true
 		}
 	}
 	affixPayloads := []string{
 		"..;", "/..;", ".;", "/.;", ";", "/;", "~", ".json", "/.json", ".html", ".css", "%00", "%20", "%09", "%0a", "%0d",
-		"%25", "%23", "%26", "%3f", "#", "../", "./", "/*", "/%2f", "/%2e", "..%3B/", `..\;/`,
+		"%25", "%26", "%3f", "../", "./", "/*", "/%2f", "/%2e", "..%3B/", `..\;/`,
 	}
 	for i, originalPart := range pathParts {
 		if originalPart == "" {
@@ -338,7 +318,7 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 		runTest("Path Wrapper", pre+"..."+suf, u.Scheme+"://"+u.Host+"/"+pre+path+suf)
 	}
 	globalSuffixes := []string{
-		"?", "??", "/?", "/??", "/.", "/..", "/*", "/%2f/", "/%20/", "/%09/", "/#", "/#/", "/#/./", "/°/", "/&", "/-", `/\//`, ";%2f..%2f..%2f",
+		"?", "??", "/?", "/??", "/.", "/..", "/*", "/%2f/", "/%20/", "/%09/", "/°/", "/&", "/-", `/\//`, ";%2f..%2f..%2f",
 	}
 	for _, suffix := range globalSuffixes {
 		runTest("Global Suffix", suffix, u.Scheme+"://"+u.Host+"/"+path+suffix)
@@ -364,68 +344,62 @@ func (s *Scanner) testPathPermutations(baseURL string, initialStatus int, initia
 	}
 }
 
-func (s *Scanner) testHTTPMethods(baseURL string, initialStatus int, initialSize int) {
+func (s *Scanner) testHTTPMethods(baseURL string, initialStatus int, initialSize int, resultsChan chan<- Result) {
 	s.log(1, "Starting HTTP Method Fuzzing tests...")
 	methods, err := utils.ReadLines(s.config.HTTPMethodsFile)
 	if err != nil {
-		utils.PrintError(fmt.Sprintf("Could not read HTTP methods file: %v", err))
 		return
 	}
 	for _, method := range methods {
 		if method == "GET" {
 			continue
 		}
-		s.checkAndReport("Method Fuzzing", method, method, baseURL, nil, initialStatus, initialSize)
+		s.checkAndReport("Method Fuzzing", method, method, baseURL, nil, initialStatus, initialSize, resultsChan)
 	}
 }
 
-func (s *Scanner) testHeaderInjection(baseURL string, initialStatus int, initialSize int) {
+func (s *Scanner) testHeaderInjection(baseURL string, initialStatus int, initialSize int, resultsChan chan<- Result) {
 	s.log(1, "Starting Header Injection tests...")
-	s.checkAndReport("Remove Host Header", "Host: <empty>", "GET", baseURL, map[string]string{"Host": ""}, initialStatus, initialSize)
+	s.checkAndReport("Remove Host Header", "Host: <empty>", "GET", baseURL, map[string]string{"Host": ""}, initialStatus, initialSize, resultsChan)
 	headers, err := utils.ReadLines(s.config.HTTPHeadersFile)
 	if err != nil {
-		utils.PrintError(fmt.Sprintf("Could not read HTTP headers file: %v", err))
 		return
 	}
 	for _, h := range headers {
 		parts := strings.SplitN(h, ":", 2)
 		if len(parts) == 2 {
 			headerMap := map[string]string{strings.TrimSpace(parts[0]): strings.TrimSpace(parts[1])}
-			s.checkAndReport("Header Injection", h, "GET", baseURL, headerMap, initialStatus, initialSize)
+			s.checkAndReport("Header Injection", h, "GET", baseURL, headerMap, initialStatus, initialSize, resultsChan)
 		}
 	}
 }
 
-func (s *Scanner) testUserAgents(baseURL string, initialStatus int, initialSize int) {
+func (s *Scanner) testUserAgents(baseURL string, initialStatus int, initialSize int, resultsChan chan<- Result) {
 	s.log(1, "Starting User-Agent Fuzzing tests...")
 	userAgents, err := utils.ReadLines(s.config.UserAgentsFile)
 	if err != nil {
-		utils.PrintError(fmt.Sprintf("Could not read User-Agents file: %v", err))
 		return
 	}
 	for _, ua := range userAgents {
 		headerMap := map[string]string{"User-Agent": ua}
-		s.checkAndReport("User-Agent Fuzzing", ua, "GET", baseURL, headerMap, initialStatus, initialSize)
+		s.checkAndReport("User-Agent Fuzzing", ua, "GET", baseURL, headerMap, initialStatus, initialSize, resultsChan)
 	}
 }
 
-func (s *Scanner) testHopByHop(baseURL string, initialStatus int) {
+func (s *Scanner) testHopByHop(baseURL string, initialStatus int, resultsChan chan<- Result) {
 	s.log(1, "Starting Hop-by-Hop Header tests...")
 	baseResp, _, err := s.sendRequest("GET", baseURL, nil)
 	if err != nil {
-		s.log(2, "Could not make base request for Hop-by-Hop test: %v", err)
 		return
 	}
 	defer baseResp.Body.Close()
 	baseBody, err := io.ReadAll(baseResp.Body)
 	if err != nil {
-		s.log(2, "Could not read base response body for Hop-by-Hop test: %v", err)
 		return
 	}
 	baseContentLength := len(baseBody)
 	hbhHeaders, err := utils.ReadLines(s.config.HopByHopHeadersFile)
 	if err != nil {
-		utils.PrintError(fmt.Sprintf("Could not read Hop-by-Hop headers file: %v", err))
 		return
 	}
 	for _, header := range hbhHeaders {
@@ -443,85 +417,148 @@ func (s *Scanner) testHopByHop(baseURL string, initialStatus int) {
 		poisonedContentLength := len(poisonedBody)
 		statusChanged := baseResp.StatusCode != poisonedResp.StatusCode
 		sizeChanged := baseContentLength != poisonedContentLength
-		if statusChanged || sizeChanged {
-			var reason string
-			if statusChanged && sizeChanged {
-				reason = fmt.Sprintf("Status changed (%d -> %d) AND Size changed (%d -> %d)", baseResp.StatusCode, poisonedResp.StatusCode, baseContentLength, poisonedContentLength)
-			} else if statusChanged {
-				reason = fmt.Sprintf("Status changed (%d -> %d)", baseResp.StatusCode, poisonedResp.StatusCode)
-			} else {
-				reason = fmt.Sprintf("Size changed (%d -> %d)", baseContentLength, poisonedContentLength)
-			}
-			s.printResult(Result{URL: baseURL, Technique: "Hop-by-Hop Header", Payload: header, StatusCode: poisonedResp.StatusCode, Curl: utils.GenerateCurlCommand(poisonedReq), Reason: reason})
+		if (statusChanged || sizeChanged) && poisonedResp.StatusCode != 400 && poisonedResp.StatusCode != 404 {
+			reason := fmt.Sprintf("Status (%d -> %d), Size (%d -> %d)", baseResp.StatusCode, poisonedResp.StatusCode, baseContentLength, poisonedContentLength)
+			resultsChan <- Result{URL: baseURL, Technique: "Hop-by-Hop Header", Payload: header, StatusCode: poisonedResp.StatusCode, Size: poisonedContentLength, Curl: utils.GenerateCurlCommand(poisonedReq, "Hop-by-Hop Header"), Reason: reason}
 		} else {
 			s.log(3, "No change for Hop-by-Hop header: %s", header)
 		}
 	}
 }
 
-func (s *Scanner) testHTTPVersions(baseURL string, initialStatus int, initialSize int) {
+func (s *Scanner) testHTTPVersions(baseURL string, initialStatus int, initialSize int, resultsChan chan<- Result) {
 	s.log(1, "Starting HTTP Version tests...")
 	req_1_0, err := http.NewRequest("GET", baseURL, nil)
 	if err == nil {
 		req_1_0.Proto = "HTTP/1.0"
 		req_1_0.ProtoMajor = 1
 		req_1_0.ProtoMinor = 0
-		s.log(2, "Attempting Technique: HTTP Version, Payload: 'HTTP/1.0'")
-		resp_1_0, err_1_0 := s.client.Do(req_1_0)
-		if err_1_0 == nil {
-			body_1_0, _ := io.ReadAll(resp_1_0.Body)
-			if (resp_1_0.StatusCode != initialStatus || len(body_1_0) != initialSize) && resp_1_0.StatusCode != 404 {
-				s.printResult(Result{URL: baseURL, Technique: "HTTP Version", Payload: "HTTP/1.0", StatusCode: resp_1_0.StatusCode, Curl: utils.GenerateCurlCommand(req_1_0) + " --http1.0", Reason: "Status/Size changed"})
-			} else {
-				s.log(3, "No change for 'HTTP/1.0' (Status: %d)", resp_1_0.StatusCode)
-			}
-			resp_1_0.Body.Close()
-		}
+		s.checkAndReport("HTTP Version", "HTTP/1.0", "GET", baseURL, nil, initialStatus, initialSize, resultsChan)
 	}
-
-	/*
-	s.log(2, "Attempting Technique: HTTP Version, Payload: 'HTTP/3'")
-	h3Client := http.Client{Transport: &http3.RoundTripper{TLSClientConfig: &tls.Config{InsecureSkipVerify: s.config.Insecure}}, Timeout: s.config.Timeout}
-	resp_3, err_3 := h3Client.Get(baseURL)
-	if err_3 == nil {
-		body_3, _ := io.ReadAll(resp_3.Body)
-		if (resp_3.StatusCode != initialStatus || len(body_3) != initialSize) && resp_3.StatusCode != 404 {
-			s.printResult(Result{URL: baseURL, Technique: "HTTP Version", Payload: "HTTP/3", StatusCode: resp_3.StatusCode, Curl: fmt.Sprintf("curl --http3 '%s'", baseURL), Reason: "Status/Size changed"})
-		} else {
-			s.log(3, "No change for 'HTTP/3' (Status: %d)", resp_3.StatusCode)
-		}
-		resp_3.Body.Close()
-	} else {
-		s.log(3, "HTTP/3 test failed to connect (likely not supported by target): %v", err_3)
-	}
-	*/
-
-	u, err := url.Parse(baseURL)
-	if err == nil {
-		host := u.Hostname()
-		port := u.Port()
-		if port == "" {
-			if u.Scheme == "https" {
-				port = "443"
-			} else {
-				port = "80"
-			}
-		}
-		s.log(2, "Attempting Technique: HTTP Version, Payload: 'HTTP/0.9'")
-		conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), s.config.Timeout)
+	if s.config.RunHTTP09 {
+		u, err := url.Parse(baseURL)
 		if err == nil {
-			defer conn.Close()
-			_, err := conn.Write([]byte(fmt.Sprintf("GET %s\r\n", u.Path)))
-			if err == nil {
-				buffer := make([]byte, 1024)
-				conn.SetReadDeadline(time.Now().Add(s.config.Timeout))
-				n, _ := conn.Read(buffer)
-				if n > 0 {
-					s.printResult(Result{URL: baseURL, Technique: "HTTP Version", Payload: "HTTP/0.9", StatusCode: 0, Curl: fmt.Sprintf("echo -ne 'GET %s\\r\\n' | nc %s %s", u.Path, host, port), Reason: "Received data on raw socket"})
+			host := u.Hostname()
+			port := u.Port()
+			if port == "" {
+				if u.Scheme == "https" {
+					port = "443"
 				} else {
-					s.log(3, "No change for 'HTTP/0.9' (no data received)")
+					port = "80"
+				}
+			}
+			s.log(2, "Attempting Technique: HTTP Version, Payload: 'HTTP/0.9'")
+			if s.limiter != nil {
+				s.limiter.Wait(context.Background())
+			}
+			if s.bar != nil {
+				_ = s.bar.Add(1)
+			}
+			conn, err := net.DialTimeout("tcp", net.JoinHostPort(host, port), s.config.Timeout)
+			if err == nil {
+				defer conn.Close()
+				_, err := conn.Write([]byte(fmt.Sprintf("GET %s\r\n", u.Path)))
+				if err == nil {
+					buffer := make([]byte, 1024)
+					conn.SetReadDeadline(time.Now().Add(s.config.Timeout))
+					n, _ := conn.Read(buffer)
+					if n > 0 {
+						curlCmd := fmt.Sprintf("curl --http0.9 '%s'", baseURL)
+						resultsChan <- Result{URL: baseURL, Technique: "HTTP Version", Payload: "HTTP/0.9", StatusCode: 0, Size: n, Curl: curlCmd, Reason: "Received data on raw socket"}
+					} else {
+						s.log(3, "No change for 'HTTP/0.9' (no data received)")
+					}
 				}
 			}
 		}
 	}
+}
+
+func CalculateTotalRequests(config Config) int {
+	count := 2
+	const avgPathSegments = 3
+	const avgSegmentLen = 6
+	runAll := config.ModesToRun["all"]
+	pathCount := 0
+	if runAll || config.ModesToRun["path"] {
+		affixPayloads := []string{"..;", "/..;", ".;", "/.;", ";", "/;", "~", ".json", "/.json", ".html", ".css", "%00", "%20", "%09", "%0a", "%0d", "%25", "%26", "%3f", "../", "./", "/*", "/%2f", "/%2e", "..%3B/", `..\;/`}
+		wrappers := map[string]string{"//": "//", "///": "///", "./": "./"}
+		globalSuffixes := []string{"?", "??", "/?", "/??", "/.", "/..", "/*", "/%2f/", "/%20/", "/%09/", "/°/", "/&", "/-", `/\//`, ";%2f..%2f..%2f"}
+		pathCount += (len(affixPayloads) * 2 * avgPathSegments)
+		pathCount += (len(generateCasePermutations("admin")) * avgPathSegments)
+		pathCount += avgPathSegments
+		pathCount += len(wrappers)
+		pathCount += len(globalSuffixes) + 1
+		pathCount += (avgPathSegments * avgSegmentLen * 2)
+	}
+	if runAll || config.ModesToRun["method"] {
+		methods, _ := utils.ReadLines(config.HTTPMethodsFile)
+		count += len(methods)
+	}
+	if runAll || config.ModesToRun["header"] {
+		headers, _ := utils.ReadLines(config.HTTPHeadersFile)
+		count += len(headers) + 1
+	}
+	if config.ModesToRun["useragent"] {
+		userAgents, _ := utils.ReadLines(config.UserAgentsFile)
+		count += len(userAgents)
+	}
+	if runAll || config.ModesToRun["hbh"] {
+		hbhHeaders, _ := utils.ReadLines(config.HopByHopHeadersFile)
+		count += len(hbhHeaders) + 1
+	}
+	if runAll || config.ModesToRun["version"] {
+		count += 1
+		if config.RunHTTP09 {
+			count += 1
+		}
+	}
+	return count + pathCount
+}
+
+func ProcessFinalResults(results []Result, config Config) {
+	if len(results) > 0 {
+		fmt.Fprint(os.Stderr, "\n\n--- Scan Finished. Results ---\n\n")
+	} else {
+		fmt.Fprint(os.Stderr, "\n--- Scan Finished ---\n")
+		utils.PrintInfo("No anomalies or bypasses found.")
+		return
+	}
+	signatures := make(map[string]int)
+	for _, r := range results {
+		signature := fmt.Sprintf("status:%d,size:%d", r.StatusCode, r.Size)
+		signatures[signature]++
+	}
+	var finalOutput []Result
+	seenSignatures := make(map[string]bool)
+	for _, r := range results {
+		signature := fmt.Sprintf("status:%d,size:%d", r.StatusCode, r.Size)
+		totalOccurrences := signatures[signature]
+		if config.FalsePositiveThreshold > 0 && totalOccurrences >= config.FalsePositiveThreshold {
+			if seenSignatures[signature] {
+				continue
+			}
+		}
+		seenSignatures[signature] = true
+		finalOutput = append(finalOutput, r)
+	}
+	for _, r := range finalOutput {
+		printFinalResult(r, signatures)
+		signature := fmt.Sprintf("status:%d,size:%d", r.StatusCode, r.Size)
+		if config.FalsePositiveThreshold > 0 && signatures[signature] >= config.FalsePositiveThreshold {
+			utils.PrintInfo(fmt.Sprintf("  └── This response pattern (%s) appeared %d times. Only the first instance is shown.", signature, signatures[signature]))
+		}
+	}
+}
+
+func printFinalResult(r Result, signatures map[string]int) {
+	msg := fmt.Sprintf("URL: %s\n  ├── Technique: %s\n  ├── Payload: '%s'\n  ├── New Status: %d\n  ├── Reason: %s\n  └── CURL: %s",
+		r.URL, r.Technique, r.Payload, r.StatusCode, r.Reason, r.Curl)
+	fmt.Fprintln(os.Stderr, "-------------------------------------------------")
+	if r.StatusCode >= 200 && r.StatusCode < 300 {
+		utils.PrintSuccess(msg)
+	} else {
+		utils.PrintWarning(msg)
+	}
+	fmt.Fprintln(os.Stderr, "-------------------------------------------------")
 }

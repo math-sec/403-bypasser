@@ -11,14 +11,15 @@ import (
 	"time"
 
 	"403-bypasser/internal/scanner"
-	"403-bypasser/internal/utils"
+	"github.com/schollz/progressbar/v3"
 	"golang.org/x/time/rate"
 )
 
 func main() {
 	config := scanner.Config{}
 	var testMode, filterSizesStr string
-	var rps int
+	var rps, fpThreshold int
+	var runHTTP09, noBar bool
 
 	flag.StringVar(&config.URL, "u", "", "Single URL to target.")
 	flag.StringVar(&config.URLList, "l", "", "File containing a list of URLs to target.")
@@ -29,6 +30,9 @@ func main() {
 	flag.StringVar(&testMode, "mode", "all", "Tests to run (comma-separated: all, path, method, header, useragent, hbh, version).")
 	flag.IntVar(&rps, "rps", 0, "Max requests per second (0 for no limit).")
 	flag.StringVar(&filterSizesStr, "fs", "", "Filter out responses with these sizes (comma-separated, e.g., 118,0,345).")
+	flag.IntVar(&fpThreshold, "fp-threshold", 3, "False positive threshold. Suppress anomaly after this many occurrences (0 to disable).")
+	flag.BoolVar(&runHTTP09, "run-http09", false, "Run the noisy HTTP/0.9 test.")
+	flag.BoolVar(&noBar, "no-bar", false, "Disable the progress bar.")
 	flag.StringVar(&config.HTTPMethodsFile, "http-methods", "wordlists/httpmethods.txt", "File with HTTP methods for fuzzing.")
 	flag.StringVar(&config.HTTPHeadersFile, "http-headers", "wordlists/httpheaders.txt", "File with HTTP headers for injection.")
 	flag.StringVar(&config.UserAgentsFile, "user-agent", "wordlists/useragents.txt", "File with User-Agents for fuzzing.")
@@ -37,7 +41,6 @@ func main() {
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "403 Bypasser - A tool to test for 403 Forbidden bypass techniques.\n\n")
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
-		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
 	}
 
@@ -48,11 +51,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	var targets []string
+	if config.URL != "" {
+		targets = append(targets, config.URL)
+	}
+	if config.URLList != "" {
+		file, err := os.Open(config.URLList)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[ERROR] Failed to open URL list file '%s': %v\n", config.URLList, err)
+			os.Exit(1)
+		}
+		defer file.Close()
+		fileScanner := bufio.NewScanner(file)
+		for fileScanner.Scan() {
+			targets = append(targets, fileScanner.Text())
+		}
+	}
+
 	config.ModesToRun = make(map[string]bool)
 	modes := strings.Split(strings.ToLower(testMode), ",")
 	for _, m := range modes {
 		config.ModesToRun[strings.TrimSpace(m)] = true
 	}
+
+	config.FalsePositiveThreshold = fpThreshold
+	config.RunHTTP09 = runHTTP09
 
 	config.FilterSizes = make(map[int]bool)
 	if filterSizesStr != "" {
@@ -65,44 +88,63 @@ func main() {
 		}
 	}
 
+	totalRequests := scanner.CalculateTotalRequests(config)
+	var bar *progressbar.ProgressBar
+	if !noBar {
+		bar = progressbar.NewOptions(totalRequests*len(targets),
+			progressbar.OptionEnableColorCodes(true),
+			progressbar.OptionSetDescription("[cyan][reset] Fuzzing"),
+			progressbar.OptionShowCount(),
+			progressbar.OptionSetTheme(progressbar.Theme{
+				Saucer:        "[green]=[reset]",
+				SaucerHead:    "[green]>[reset]",
+				SaucerPadding: " ",
+				BarStart:      "[",
+				BarEnd:        "]",
+			}))
+	}
+
 	var limiter *rate.Limiter
 	if rps > 0 {
 		limiter = rate.NewLimiter(rate.Limit(rps), 1)
 	}
 
-	urls := make(chan string, config.Concurrency)
-	var wg sync.WaitGroup
+	resultsChan := make(chan scanner.Result, totalRequests*len(targets))
+	urlsChan := make(chan string, len(targets))
 
+	for _, t := range targets {
+		urlsChan <- t
+	}
+	close(urlsChan)
+
+	sharedSignatures := &scanner.SharedSignatureMap{
+		Signatures: make(map[string]int),
+		Mutex:      &sync.Mutex{},
+	}
+
+	var wg sync.WaitGroup
 	for i := 0; i < config.Concurrency; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for url := range urls {
-				s := scanner.NewScanner(config, limiter)
-				s.Scan(url)
+			for url := range urlsChan {
+				s := scanner.NewScanner(config, limiter, sharedSignatures, bar)
+				s.Scan(url, resultsChan)
 			}
 		}()
 	}
 
-	if config.URL != "" {
-		urls <- config.URL
-	}
-
-	if config.URLList != "" {
-		file, err := os.Open(config.URLList)
-		if err != nil {
-			utils.PrintError(fmt.Sprintf("Failed to open URL list file '%s': %v", config.URLList, err))
-			os.Exit(1)
-		}
-		defer file.Close()
-		fileScanner := bufio.NewScanner(file)
-		for fileScanner.Scan() {
-			urls <- fileScanner.Text()
-		}
-	}
-
-	close(urls)
 	wg.Wait()
-	fmt.Println()
-	utils.PrintInfo("All tests completed.")
+	close(resultsChan)
+
+	var finalResults []scanner.Result
+	for result := range resultsChan {
+		finalResults = append(finalResults, result)
+	}
+
+	if bar != nil {
+		_ = bar.Finish()
+	}
+
+	scanner.ProcessFinalResults(finalResults, config)
 }
